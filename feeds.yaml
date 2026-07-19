@@ -10,3 +10,7 @@ feeds:
   - id: bytebytego
     name: ByteByteGo
     url: https://blog.bytebytego.com/feed
+
+  - id: betterengineers
+    name: Better Engineers
+    url: https://betterengineers.substack.com/feed
