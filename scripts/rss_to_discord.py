@@ -9,6 +9,8 @@ import html
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
@@ -32,9 +34,20 @@ except ImportError:  # pragma: no cover
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "feeds.yaml"
 STATE_DIR = ROOT / "state"
-USER_AGENT = "newsfeed-discord/1.0 (+https://github.com/sandjaie/newsfeed-discord)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+FETCH_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
 DISCORD_RATE_LIMIT_PAUSE_S = 1.0
 MAX_SEEN_IDS = 500
+FETCH_RETRIES = 3
 IMAGE_URL_RE = re.compile(
     r"https?://[^\s\"'<>]+?\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\"'<>]*)?",
     re.IGNORECASE,
@@ -237,10 +250,53 @@ def parse_feed(xml_bytes: bytes) -> list[dict]:
     return items
 
 
-def fetch_url(url: str, timeout: int = 30) -> bytes:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+def fetch_url_urllib(url: str, timeout: int = 30) -> bytes:
+    req = urllib.request.Request(url, headers=FETCH_HEADERS)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
+
+
+def fetch_url_curl(url: str, timeout: int = 30) -> bytes:
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("curl not available")
+    cmd = [
+        curl,
+        "-fsSL",
+        "--max-time",
+        str(timeout),
+        "-A",
+        USER_AGENT,
+        "-H",
+        f"Accept: {FETCH_HEADERS['Accept']}",
+        "-H",
+        f"Accept-Language: {FETCH_HEADERS['Accept-Language']}",
+        "-H",
+        f"Referer: {url.rsplit('/feed', 1)[0]}/",
+        url,
+    ]
+    result = subprocess.run(cmd, check=False, capture_output=True)
+    if result.returncode != 0:
+        err = (result.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"curl failed ({result.returncode}): {err or 'unknown error'}")
+    return result.stdout
+
+
+def fetch_url(url: str, timeout: int = 30) -> bytes:
+    last_error: Exception | None = None
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            # curl handles Cloudflare / HTTP2 more reliably on GitHub-hosted runners.
+            if shutil.which("curl"):
+                return fetch_url_curl(url, timeout=timeout)
+            return fetch_url_urllib(url, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - retry then surface
+            last_error = exc
+            if attempt < FETCH_RETRIES:
+                time.sleep(attempt)
+                continue
+    assert last_error is not None
+    raise last_error
 
 
 def load_state(feed_id: str) -> dict:
@@ -460,19 +516,24 @@ def main() -> int:
             raise SystemExit(f"Unknown feed id(s): {', '.join(sorted(missing))}")
 
     total = 0
+    failures = 0
     for feed in feeds:
         if not feed.get("id") or not feed.get("url"):
             raise SystemExit(f"Each feed needs id and url: {feed!r}")
-        total += process_feed(
-            feed,
-            webhook_url,
-            dry_run=args.dry_run,
-            backfill=args.backfill,
-            lookback_hours=lookback_hours,
-        )
+        try:
+            total += process_feed(
+                feed,
+                webhook_url,
+                dry_run=args.dry_run,
+                backfill=args.backfill,
+                lookback_hours=lookback_hours,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep other feeds running
+            failures += 1
+            print(f"  ERROR processing {feed.get('id')}: {exc}", file=sys.stderr)
 
-    print(f"Done. Posted {total} item(s).")
-    return 0
+    print(f"Done. Posted {total} item(s). Failures: {failures}.")
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
