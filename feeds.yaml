@@ -1,0 +1,8 @@
+# Shared Discord webhook (GitHub secret name). All feeds post to the same channel.
+discord_webhook_env: DISCORD_WEBHOOK
+
+# Add a new newsletter by appending a feed block below.
+feeds:
+  - id: bytebytego
+    name: ByteByteGo
+    url: https://blog.bytebytego.com/feed

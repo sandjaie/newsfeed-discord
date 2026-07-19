@@ -1,0 +1,2 @@
+PyYAML>=6.0
+defusedxml>=0.7

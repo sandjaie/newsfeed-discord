@@ -1,0 +1,72 @@
+name: RSS to Discord
+
+on:
+  schedule:
+    # Every 2 hours
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "On first run of a feed, post this many newest items (0 = seed only)"
+        required: false
+        default: "0"
+      dry_run:
+        description: "Fetch only; do not post or update state"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rss-to-discord
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync feeds to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          BACKFILL: ${{ github.event.inputs.backfill || '0' }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          if [[ "$BACKFILL" =~ ^[0-9]+$ ]] && [[ "$BACKFILL" != "0" ]]; then
+            ARGS+=(--backfill "$BACKFILL")
+          fi
+          if [[ "$DRY_RUN" == "true" ]]; then
+            ARGS+=(--dry-run)
+          fi
+          python scripts/rss_to_discord.py "${ARGS[@]}"
+
+      - name: Commit state updates
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run != 'true') }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- state; then
+            echo "No state changes"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state
+          git commit -m "chore: update RSS seen-state"
+          git push
