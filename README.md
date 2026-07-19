@@ -5,9 +5,10 @@ Post new RSS / Substack articles to a Discord channel via webhook.
 ## How it works
 
 1. Feeds are listed in [`feeds.yaml`](feeds.yaml).
-2. A GitHub Action runs every 2 hours (and on demand).
-3. New items are posted to one Discord webhook (same channel for all feeds).
-4. Seen article IDs are stored under [`state/`](state/) so posts are not repeated.
+2. A GitHub Action runs **once daily at 05:00 UTC (09:00 Gulf / UTC+4)** and on demand.
+3. Unseen articles from the last `lookback_hours` (default 24) are posted to one Discord webhook.
+4. Posts include title, summary, link, and the article cover image when the feed provides one.
+5. Seen article IDs are stored under [`state/`](state/) so posts are not repeated.
 
 ## Add a feed later
 

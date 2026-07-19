@@ -2,8 +2,8 @@ name: RSS to Discord
 
 on:
   schedule:
-    # Every 2 hours
-    - cron: "0 */2 * * *"
+    # Once daily at 05:00 UTC (09:00 Gulf / UTC+4)
+    - cron: "0 5 * * *"
   workflow_dispatch:
     inputs:
       backfill:

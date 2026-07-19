@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import email.utils
 import html
 import json
 import os
@@ -12,7 +13,9 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from xml.etree.ElementTree import Element
 
 try:
     import yaml
@@ -32,6 +35,14 @@ STATE_DIR = ROOT / "state"
 USER_AGENT = "newsfeed-discord/1.0 (+https://github.com/sandjaie/newsfeed-discord)"
 DISCORD_RATE_LIMIT_PAUSE_S = 1.0
 MAX_SEEN_IDS = 500
+IMAGE_URL_RE = re.compile(
+    r"https?://[^\s\"'<>]+?\.(?:jpg|jpeg|png|webp|gif)(?:\?[^\s\"'<>]*)?",
+    re.IGNORECASE,
+)
+IMG_TAG_RE = re.compile(
+    r"<img[^>]+src=[\"'](https?://[^\"']+)[\"']",
+    re.IGNORECASE,
+)
 
 
 def load_config(path: Path) -> dict:
@@ -62,18 +73,99 @@ def local_name(tag: str) -> str:
     return tag
 
 
-def text_of(el: ET.Element | None) -> str:
+def text_of(el: Element | None) -> str:
     if el is None:
         return ""
     return (el.text or "").strip()
 
 
-def child(el: ET.Element, *names: str) -> ET.Element | None:
+def child(el: Element, *names: str) -> Element | None:
     wanted = set(names)
     for child_el in list(el):
         if local_name(child_el.tag) in wanted:
             return child_el
     return None
+
+
+def children(el: Element, *names: str) -> list[Element]:
+    wanted = set(names)
+    return [child_el for child_el in list(el) if local_name(child_el.tag) in wanted]
+
+
+def is_image_url(url: str) -> bool:
+    if not url:
+        return False
+    lower = url.lower().split("?", 1)[0]
+    return lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")) or "image" in lower
+
+
+def html_body(el: Element) -> str:
+    """Return HTML body text, skipping media:* nodes that only carry a url attr."""
+    for name in ("encoded", "content", "description", "summary"):
+        node = child(el, name)
+        if node is None:
+            continue
+        if node.attrib.get("url") and not (node.text or "").strip():
+            continue
+        text = text_of(node)
+        if text:
+            return text
+    return ""
+
+
+def extract_image(el: Element, content_html: str = "") -> str | None:
+    # 1) media:content / media:thumbnail
+    for media_el in children(el, "content", "thumbnail"):
+        url = media_el.attrib.get("url") or media_el.attrib.get("href") or ""
+        medium = media_el.attrib.get("medium", "")
+        mime = media_el.attrib.get("type", "")
+        if url and (medium == "image" or mime.startswith("image/") or is_image_url(url)):
+            return url
+
+    # 2) RSS enclosure (Substack cover image)
+    for enc in children(el, "enclosure"):
+        url = enc.attrib.get("url", "")
+        mime = enc.attrib.get("type", "")
+        if url and (mime.startswith("image/") or is_image_url(url)):
+            return url
+
+    # 3) nested <image><url>
+    image_el = child(el, "image")
+    if image_el is not None:
+        url = text_of(child(image_el, "url")) or image_el.attrib.get("href", "")
+        if url:
+            return url
+
+    # 4) first <img> / image URL in HTML body
+    for match in IMG_TAG_RE.finditer(content_html or ""):
+        return match.group(1)
+    match = IMAGE_URL_RE.search(content_html or "")
+    if match:
+        return match.group(0)
+    return None
+
+
+def parse_datetime(value: str) -> datetime | None:
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        dt = email.utils.parsedate_to_datetime(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, IndexError):
+        pass
+    try:
+        # Atom-style timestamps
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def parse_feed(xml_bytes: bytes) -> list[dict]:
@@ -89,18 +181,19 @@ def parse_feed(xml_bytes: bytes) -> list[dict]:
         guid_el = child(item, "guid")
         guid = text_of(guid_el) or link or title
         desc = text_of(child(item, "description")) or text_of(child(item, "summary"))
-        content_el = child(item, "encoded", "content")
-        if content_el is not None and (content_el.text or "").strip():
-            desc = content_el.text or desc
+        content_html = html_body(item)
         pub = text_of(child(item, "pubDate", "published", "updated"))
+        image = extract_image(item, content_html or desc)
         if title and (link or guid):
             items.append(
                 {
                     "id": guid,
                     "title": strip_html(title),
                     "link": link,
-                    "summary": truncate(strip_html(desc)),
+                    "summary": truncate(strip_html(desc or content_html)),
                     "published": pub,
+                    "published_at": parse_datetime(pub),
+                    "image": image,
                 }
             )
 
@@ -124,16 +217,20 @@ def parse_feed(xml_bytes: bytes) -> list[dict]:
             if href and not link:
                 link = href
         entry_id = text_of(child(entry, "id")) or link or title
-        summary = text_of(child(entry, "summary")) or text_of(child(entry, "content"))
+        summary = text_of(child(entry, "summary"))
+        content_html = html_body(entry)
         pub = text_of(child(entry, "published", "updated"))
+        image = extract_image(entry, content_html or summary)
         if title and (link or entry_id):
             items.append(
                 {
                     "id": entry_id,
                     "title": strip_html(title),
                     "link": link,
-                    "summary": truncate(strip_html(summary)),
+                    "summary": truncate(strip_html(summary or content_html)),
                     "published": pub,
+                    "published_at": parse_datetime(pub),
+                    "image": image,
                 }
             )
 
@@ -167,21 +264,28 @@ def save_state(feed_id: str, state: dict) -> None:
 
 def post_discord(webhook_url: str, feed_name: str, item: dict, dry_run: bool) -> None:
     description = item["summary"] or "New article"
-    embed = {
+    embed: dict = {
         "title": item["title"][:256],
         "description": description[:4096],
-        "url": item["link"] or None,
         "color": 0x5865F2,
         "author": {"name": feed_name},
     }
-    if not embed["url"]:
-        embed.pop("url")
+    if item.get("link"):
+        embed["url"] = item["link"]
+    if item.get("image"):
+        embed["image"] = {"url": item["image"]}
+    if item.get("published"):
+        # Discord wants ISO8601; fall back to raw string only if parsed.
+        published_at = item.get("published_at")
+        if isinstance(published_at, datetime):
+            embed["timestamp"] = published_at.isoformat().replace("+00:00", "Z")
 
     payload = {"embeds": [embed]}
     body = json.dumps(payload).encode("utf-8")
 
     if dry_run:
-        print(f"[dry-run] {feed_name}: {item['title']} -> {item['link']}")
+        image_note = f" image={item['image']}" if item.get("image") else " image=<none>"
+        print(f"[dry-run] {feed_name}: {item['title']} -> {item['link']}{image_note}")
         return
 
     req = urllib.request.Request(
@@ -201,24 +305,35 @@ def post_discord(webhook_url: str, feed_name: str, item: dict, dry_run: bool) ->
     time.sleep(DISCORD_RATE_LIMIT_PAUSE_S)
 
 
+def within_lookback(item: dict, lookback_hours: int, now: datetime) -> bool:
+    if lookback_hours <= 0:
+        return True
+    published_at = item.get("published_at")
+    if not isinstance(published_at, datetime):
+        # If a feed omits dates, still allow unseen items through.
+        return True
+    return published_at >= now - timedelta(hours=lookback_hours)
+
+
 def process_feed(
     feed: dict,
     webhook_url: str,
     *,
     dry_run: bool,
     backfill: int,
+    lookback_hours: int,
 ) -> int:
     feed_id = feed["id"]
     feed_name = feed.get("name") or feed_id
     url = feed["url"]
+    now = datetime.now(timezone.utc)
 
     print(f"Fetching {feed_name}: {url}")
     items = parse_feed(fetch_url(url))
     if not items:
-        print(f"  no items found")
+        print("  no items found")
         return 0
 
-    # Feeds are newest-first; keep that order for posting.
     state = load_state(feed_id)
     seen = set(state["seen_ids"])
     posted = 0
@@ -231,6 +346,8 @@ def process_feed(
                 post_discord(webhook_url, feed_name, item, dry_run=dry_run)
                 seen.add(item["id"])
                 posted += 1
+            # Mark the rest as seen so we don't flood later.
+            seen.update(item["id"] for item in items)
         else:
             print(f"  first run: seeding {len(items)} item(s) without posting")
             seen.update(item["id"] for item in items)
@@ -243,20 +360,36 @@ def process_feed(
             print("  [dry-run] state not written")
         return posted
 
-    new_items = [item for item in items if item["id"] not in seen]
-    # Post oldest first so channel order matches publish order.
-    new_items.reverse()
+    candidates = [item for item in items if item["id"] not in seen]
+    # Mark everything currently in the feed as seen eventually, including
+    # items outside the lookback window, so old IDs don't linger forever.
+    to_post = [
+        item
+        for item in candidates
+        if within_lookback(item, lookback_hours, now)
+    ]
+    skipped = len(candidates) - len(to_post)
+    if skipped:
+        print(f"  skipped {skipped} unseen item(s) outside {lookback_hours}h lookback")
 
-    if not new_items:
-        print("  no new items")
+    # Post oldest first so channel order matches publish order.
+    to_post.reverse()
+
+    if not to_post:
+        print("  no new items in lookback window")
+        seen.update(item["id"] for item in items)
+        state["seen_ids"] = list(seen)
+        if not dry_run:
+            save_state(feed_id, state)
         return 0
 
-    print(f"  posting {len(new_items)} new item(s)")
-    for item in new_items:
+    print(f"  posting {len(to_post)} new item(s)")
+    for item in to_post:
         post_discord(webhook_url, feed_name, item, dry_run=dry_run)
         seen.add(item["id"])
         posted += 1
 
+    seen.update(item["id"] for item in items)
     state["seen_ids"] = list(seen)
     if not dry_run:
         save_state(feed_id, state)
@@ -297,6 +430,12 @@ def main() -> int:
         help="On first run for a feed, post the N newest items instead of only seeding",
     )
     parser.add_argument(
+        "--lookback-hours",
+        type=int,
+        default=None,
+        help="Override feeds.yaml lookback_hours",
+    )
+    parser.add_argument(
         "--feed",
         action="append",
         dest="feed_ids",
@@ -306,6 +445,11 @@ def main() -> int:
 
     config = load_config(args.config)
     webhook_url = "https://example.invalid/webhook" if args.dry_run else resolve_webhook(config)
+    lookback_hours = (
+        args.lookback_hours
+        if args.lookback_hours is not None
+        else int(config.get("lookback_hours") or 24)
+    )
 
     feeds = config["feeds"]
     if args.feed_ids:
@@ -324,6 +468,7 @@ def main() -> int:
             webhook_url,
             dry_run=args.dry_run,
             backfill=args.backfill,
+            lookback_hours=lookback_hours,
         )
 
     print(f"Done. Posted {total} item(s).")

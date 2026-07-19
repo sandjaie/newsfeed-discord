@@ -1,6 +1,10 @@
 # Shared Discord webhook (GitHub secret name). All feeds post to the same channel.
 discord_webhook_env: DISCORD_WEBHOOK
 
+# Only post articles published within this window (hours).
+# Seen-state still prevents duplicates across runs.
+lookback_hours: 24
+
 # Add a new newsletter by appending a feed block below.
 feeds:
   - id: bytebytego
