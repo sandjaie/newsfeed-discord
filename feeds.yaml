@@ -14,3 +14,7 @@ feeds:
   - id: betterengineers
     name: Better Engineers
     url: https://betterengineers.substack.com/feed
+
+  - id: pragmaticengineer
+    name: The Pragmatic Engineer
+    url: https://newsletter.pragmaticengineer.com/feed
