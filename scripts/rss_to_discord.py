@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -299,6 +300,56 @@ def fetch_url(url: str, timeout: int = 30) -> bytes:
     raise last_error
 
 
+def parse_rss2json(payload: dict) -> list[dict]:
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"rss2json status={payload.get('status')!r}")
+    items: list[dict] = []
+    for raw in payload.get("items") or []:
+        title = strip_html(raw.get("title") or "")
+        link = (raw.get("link") or "").strip()
+        guid = (raw.get("guid") or link or title).strip()
+        desc = raw.get("description") or ""
+        content_html = raw.get("content") or desc
+        pub = (raw.get("pubDate") or "").strip()
+        image = (raw.get("thumbnail") or "").strip() or None
+        if not image:
+            for match in IMG_TAG_RE.finditer(content_html or ""):
+                image = match.group(1)
+                break
+            if not image:
+                match = IMAGE_URL_RE.search(content_html or "")
+                image = match.group(0) if match else None
+        if title and (link or guid):
+            items.append(
+                {
+                    "id": guid,
+                    "title": title,
+                    "link": link,
+                    "summary": truncate(strip_html(desc or content_html)),
+                    "published": pub,
+                    "published_at": parse_datetime(pub),
+                    "image": image,
+                }
+            )
+    return items
+
+
+def fetch_feed_items(url: str) -> list[dict]:
+    """Fetch RSS items, falling back to rss2json when the origin blocks datacenter IPs."""
+    try:
+        return parse_feed(fetch_url(url))
+    except Exception as direct_exc:  # noqa: BLE001
+        print(f"  direct fetch failed ({direct_exc}); trying rss2json fallback")
+        encoded = urllib.parse.quote(url, safe="")
+        proxy = f"https://api.rss2json.com/v1/api.json?rss_url={encoded}"
+        raw = fetch_url_urllib(proxy)
+        payload = json.loads(raw.decode("utf-8"))
+        items = parse_rss2json(payload)
+        if not items:
+            raise RuntimeError(f"rss2json returned no items after direct failure: {direct_exc}") from direct_exc
+        return items
+
+
 def load_state(feed_id: str) -> dict:
     path = STATE_DIR / f"{feed_id}.json"
     if not path.exists():
@@ -385,7 +436,7 @@ def process_feed(
     now = datetime.now(timezone.utc)
 
     print(f"Fetching {feed_name}: {url}")
-    items = parse_feed(fetch_url(url))
+    items = fetch_feed_items(url)
     if not items:
         print("  no items found")
         return 0
@@ -533,7 +584,9 @@ def main() -> int:
             print(f"  ERROR processing {feed.get('id')}: {exc}", file=sys.stderr)
 
     print(f"Done. Posted {total} item(s). Failures: {failures}.")
-    return 1 if failures else 0
+    # Fail the job only when every feed failed, so successful feeds can still
+    # commit seen-state updates.
+    return 1 if failures and failures == len(feeds) else 0
 
 
 if __name__ == "__main__":
